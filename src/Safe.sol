@@ -26,12 +26,26 @@ library Safe {
     error ArrayLengthsMismatch(uint256 a, uint256 b);
     error ProposeTransactionFailed(uint256 statusCode, string response);
 
+    enum SignerType {
+        Ledger,
+        Trezor,
+        PrivateKey
+    }
+
+    struct Signer {
+        address signer;
+        SignerType signerType;
+        string derivationPath;
+        uint256 privateKey;
+    }
+
     struct Instance {
         address safe;
         HTTP.Client http;
         mapping(uint256 chainId => string) urls;
         mapping(uint256 chainId => MultiSendCallOnly) multiSendCallOnly;
         string requestBody;
+        Signer signer;
     }
 
     struct Signature {
@@ -54,10 +68,11 @@ library Safe {
         uint256 nonce;
     }
 
-    function initialize(Client storage self, address safe) internal returns (Client storage) {
+    function initialize(Client storage self, address safe, Signer memory _signer) internal returns (Client storage) {
         self.instances.push();
         Instance storage i = self.instances[self.instances.length - 1];
         i.safe = safe;
+        i.signer = _signer;
         // https://github.com/safe-global/safe-core-sdk/blob/4d89cb9b1559e4349c323a48a10caf685f7f8c88/packages/api-kit/src/utils/config.ts
         i.urls[1] = "https://api.safe.global/tx-service/eth/api";
         i.urls[10] = "https://api.safe.global/tx-service/oeth/api";
@@ -134,6 +149,10 @@ library Safe {
         return ISafeSmartAccount(instance(self).safe).nonce();
     }
 
+    function signer(Client storage self) internal view returns (Signer memory) {
+        return instance(self).signer;
+    }
+
     function getSafeTxHash(
         Client storage self,
         address to,
@@ -179,68 +198,17 @@ library Safe {
         return safeTxHash;
     }
 
-    function proposeTransaction(Client storage self, address to, bytes memory data, address sender)
-        internal
-        returns (bytes32)
-    {
+    function proposeTransaction(Client storage self, address to, bytes memory data) internal returns (bytes32) {
         ExecTransactionParams memory params = ExecTransactionParams({
             to: to,
             value: 0,
             data: data,
             operation: Enum.Operation.Call,
-            sender: sender,
-            signature: sign(self, to, data, Enum.Operation.Call, sender, string("")),
+            sender: signer(self).signer,
+            signature: sign(self, to, data, Enum.Operation.Call),
             nonce: getNonce(self)
         });
         return proposeTransaction(self, params);
-    }
-
-    function proposeTransaction(
-        Client storage self,
-        address to,
-        bytes memory data,
-        address sender,
-        string memory derivationPath
-    ) internal returns (bytes32) {
-        ExecTransactionParams memory params = ExecTransactionParams({
-            to: to,
-            value: 0,
-            data: data,
-            operation: Enum.Operation.Call,
-            sender: sender,
-            signature: sign(self, to, data, Enum.Operation.Call, sender, derivationPath),
-            nonce: getNonce(self)
-        });
-        return proposeTransaction(self, params);
-    }
-
-    /// @notice Propose a transaction with a precomputed signature
-    /// @dev    This can be used to propose transactions signed with a hardware wallet in a two-step process
-    ///
-    /// @param  self        The Safe client
-    /// @param  to          The target address for the transaction
-    /// @param  data        The data payload for the transaction
-    /// @param  sender      The address of the account that is proposing the transaction
-    /// @param  signature   The precomputed signature for the transaction, e.g. using {sign}
-    /// @return txHash      The hash of the proposed Safe transaction
-    function proposeTransactionWithSignature(
-        Client storage self,
-        address to,
-        bytes memory data,
-        address sender,
-        bytes memory signature
-    ) internal returns (bytes32 txHash) {
-        ExecTransactionParams memory params = ExecTransactionParams({
-            to: to,
-            value: 0,
-            data: data,
-            operation: Enum.Operation.Call,
-            sender: sender,
-            signature: signature,
-            nonce: getNonce(self)
-        });
-        txHash = proposeTransaction(self, params);
-        return txHash;
     }
 
     function getProposeTransactionsTargetAndData(Client storage self, address[] memory targets, bytes[] memory datas)
@@ -264,13 +232,10 @@ library Safe {
         return (to, data);
     }
 
-    function proposeTransactions(
-        Client storage self,
-        address[] memory targets,
-        bytes[] memory datas,
-        address sender,
-        string memory derivationPath
-    ) internal returns (bytes32) {
+    function proposeTransactions(Client storage self, address[] memory targets, bytes[] memory datas)
+        internal
+        returns (bytes32)
+    {
         (address to, bytes memory data) = getProposeTransactionsTargetAndData(self, targets, datas);
         // using DelegateCall to preserve msg.sender across sub-calls
         ExecTransactionParams memory params = ExecTransactionParams({
@@ -278,53 +243,14 @@ library Safe {
             value: 0,
             data: data,
             operation: Enum.Operation.DelegateCall,
-            sender: sender,
-            signature: sign(self, to, data, Enum.Operation.DelegateCall, sender, derivationPath),
+            sender: signer(self).signer,
+            signature: sign(self, to, data, Enum.Operation.DelegateCall),
             nonce: getNonce(self)
         });
         return proposeTransaction(self, params);
     }
 
-    /// @notice Propose multiple transactions with a precomputed signature
-    /// @dev    This can be used to propose transactions signed with a hardware wallet in a two-step process.
-    ///         The signature must be created with Enum.Operation.DelegateCall, as batch transactions use
-    ///         DelegateCall to preserve msg.sender across sub-calls.
-    ///
-    ///         WARNING: Using Enum.Operation.Call instead of DelegateCall will cause the Safe API to reject
-    ///         your transaction with an error about an incorrect signer address. The signature will be invalid
-    ///         because it was signed with the wrong operation type.
-    ///
-    /// @param  self        The Safe client
-    /// @param  targets     The list of target addresses for the transactions
-    /// @param  datas       The list of data payloads for the transactions
-    /// @param  sender      The address of the account that is proposing the transactions
-    /// @param  signature   The precomputed signature for the batch of transactions. MUST be signed with
-    ///                     Enum.Operation.DelegateCall (use {sign} with DelegateCall operation).
-    ///                     Signing with Call instead of DelegateCall will result in signature validation failure.
-    /// @return txHash      The hash of the proposed Safe transaction
-    function proposeTransactionsWithSignature(
-        Client storage self,
-        address[] memory targets,
-        bytes[] memory datas,
-        address sender,
-        bytes memory signature
-    ) internal returns (bytes32 txHash) {
-        (address to, bytes memory data) = getProposeTransactionsTargetAndData(self, targets, datas);
-        // using DelegateCall to preserve msg.sender across sub-calls
-        ExecTransactionParams memory params = ExecTransactionParams({
-            to: to,
-            value: 0,
-            data: data,
-            operation: Enum.Operation.DelegateCall,
-            sender: sender,
-            signature: signature,
-            nonce: getNonce(self)
-        });
-        txHash = proposeTransaction(self, params);
-        return txHash;
-    }
-
-    function getExecTransactionData(Client storage self, address to, bytes memory data, address sender)
+    function getExecTransactionData(Client storage self, address to, bytes memory data)
         internal
         returns (bytes memory)
     {
@@ -333,48 +259,17 @@ library Safe {
             value: 0,
             data: data,
             operation: Enum.Operation.Call,
-            sender: sender,
-            signature: sign(self, to, data, Enum.Operation.Call, sender, string("")),
+            sender: signer(self).signer,
+            signature: sign(self, to, data, Enum.Operation.Call),
             nonce: getNonce(self)
         });
         return getExecTransactionData(self, params);
     }
 
-    function getExecTransactionData(
-        Client storage self,
-        address to,
-        bytes memory data,
-        address sender,
-        string memory derivationPath
-    ) internal returns (bytes memory) {
-        ExecTransactionParams memory params = ExecTransactionParams({
-            to: to,
-            value: 0,
-            data: data,
-            operation: Enum.Operation.Call,
-            sender: sender,
-            signature: sign(self, to, data, Enum.Operation.Call, sender, derivationPath),
-            nonce: getNonce(self)
-        });
-        return getExecTransactionData(self, params);
-    }
-
-    function getExecTransactionsData(
-        Client storage self,
-        address[] memory targets,
-        bytes[] memory datas,
-        address sender
-    ) internal returns (bytes memory) {
-        return getExecTransactionsData(self, targets, datas, sender, string(""));
-    }
-
-    function getExecTransactionsData(
-        Client storage self,
-        address[] memory targets,
-        bytes[] memory datas,
-        address sender,
-        string memory derivationPath
-    ) internal returns (bytes memory) {
+    function getExecTransactionsData(Client storage self, address[] memory targets, bytes[] memory datas)
+        internal
+        returns (bytes memory)
+    {
         (address to, bytes memory data) = getProposeTransactionsTargetAndData(self, targets, datas);
         // using DelegateCall to preserve msg.sender across sub-calls
         ExecTransactionParams memory params = ExecTransactionParams({
@@ -382,8 +277,8 @@ library Safe {
             value: 0,
             data: data,
             operation: Enum.Operation.DelegateCall,
-            sender: sender,
-            signature: sign(self, to, data, Enum.Operation.DelegateCall, sender, derivationPath),
+            sender: signer(self).signer,
+            signature: sign(self, to, data, Enum.Operation.DelegateCall),
             nonce: getNonce(self)
         });
         return getExecTransactionData(self, params);
@@ -400,57 +295,49 @@ library Safe {
         );
     }
 
-    /// @notice Prepare the signature for a transaction, using a custom nonce
-    ///
-    /// @param  self            The Safe client
-    /// @param  to              The target address for the transaction
-    /// @param  data            The data payload for the transaction
-    /// @param  operation       The operation to perform
-    /// @param  sender          The address of the account that is signing the transaction
-    /// @param  nonce           The nonce of the transaction
-    /// @param  derivationPath  The derivation path for the transaction
-    /// @return signature       The signature for the transaction
-    function sign(
-        Client storage self,
-        address to,
-        bytes memory data,
-        Enum.Operation operation,
-        address sender,
-        uint256 nonce,
-        string memory derivationPath
-    ) internal returns (bytes memory) {
-        if (bytes(derivationPath).length > 0) {
-            string[] memory inputs = new string[](8);
+    function sign(Client storage self, address to, bytes memory data, Enum.Operation operation)
+        internal
+        returns (bytes memory)
+    {
+        uint256 nonce = getNonce(self);
+        string memory payload = string.concat(
+            '{"domain":{"chainId":"',
+            vm.toString(block.chainid),
+            '","verifyingContract":"',
+            vm.toString(instance(self).safe),
+            '"},"message":{"to":"',
+            vm.toString(to),
+            '","value":"0","data":"',
+            vm.toString(data),
+            '","operation":',
+            vm.toString(uint8(operation)),
+            ',"baseGas":"0","gasPrice":"0","gasToken":"0x0000000000000000000000000000000000000000","refundReceiver":"0x0000000000000000000000000000000000000000","nonce":',
+            vm.toString(nonce),
+            ',"safeTxGas":"0"},"primaryType":"SafeTx","types":{"SafeTx":[{"name":"to","type":"address"},{"name":"value","type":"uint256"},{"name":"data","type":"bytes"},{"name":"operation","type":"uint8"},{"name":"safeTxGas","type":"uint256"},{"name":"baseGas","type":"uint256"},{"name":"gasPrice","type":"uint256"},{"name":"gasToken","type":"address"},{"name":"refundReceiver","type":"address"},{"name":"nonce","type":"uint256"}]}}'
+        );
+        string[] memory inputs;
+        if (signer(self).signerType == SignerType.Ledger || signer(self).signerType == SignerType.Trezor) {
+            inputs = new string[](8);
             inputs[0] = "cast";
             inputs[1] = "wallet";
             inputs[2] = "sign";
-            inputs[3] = "--ledger";
+            inputs[3] = string.concat("--", signer(self).signerType == SignerType.Ledger ? "ledger" : "trezor");
             inputs[4] = "--mnemonic-derivation-path";
-            inputs[5] = derivationPath;
+            inputs[5] = signer(self).derivationPath;
             inputs[6] = "--data";
-            inputs[7] = string.concat(
-                '{"domain":{"chainId":"',
-                vm.toString(block.chainid),
-                '","verifyingContract":"',
-                vm.toString(instance(self).safe),
-                '"},"message":{"to":"',
-                vm.toString(to),
-                '","value":"0","data":"',
-                vm.toString(data),
-                '","operation":',
-                vm.toString(uint8(operation)),
-                ',"baseGas":"0","gasPrice":"0","gasToken":"0x0000000000000000000000000000000000000000","refundReceiver":"0x0000000000000000000000000000000000000000","nonce":',
-                vm.toString(nonce),
-                ',"safeTxGas":"0"},"primaryType":"SafeTx","types":{"SafeTx":[{"name":"to","type":"address"},{"name":"value","type":"uint256"},{"name":"data","type":"bytes"},{"name":"operation","type":"uint8"},{"name":"safeTxGas","type":"uint256"},{"name":"baseGas","type":"uint256"},{"name":"gasPrice","type":"uint256"},{"name":"gasToken","type":"address"},{"name":"refundReceiver","type":"address"},{"name":"nonce","type":"uint256"}]}}'
-            );
-            /// forge-lint: disable-next-line(unsafe-cheatcode)
-            bytes memory output = vm.ffi(inputs);
-            return output;
+            inputs[7] = payload;
         } else {
-            Signature memory sig;
-            (sig.v, sig.r, sig.s) = vm.sign(sender, getSafeTxHash(self, to, 0, data, operation, nonce));
-            return abi.encodePacked(sig.r, sig.s, sig.v);
+            inputs = new string[](7);
+            inputs[0] = "cast";
+            inputs[1] = "wallet";
+            inputs[2] = "sign";
+            inputs[3] = string.concat("--private-key");
+            inputs[4] = vm.toString(bytes32(signer(self).privateKey));
+            inputs[5] = "--data";
+            inputs[6] = payload;
         }
+        bytes memory output = vm.ffi(inputs);
+        return output;
     }
 
     /// @notice Prepare the signature for a transaction, using the nonce from the Safe
