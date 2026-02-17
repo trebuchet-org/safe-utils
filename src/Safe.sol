@@ -341,16 +341,4 @@ library Safe {
         bytes memory output = vm.ffi(inputs);
         return output;
     }
-
-    /// @notice Prepare the signature for a transaction, using the nonce from the Safe
-    function sign(
-        Client storage self,
-        address to,
-        bytes memory data,
-        Enum.Operation operation,
-        address sender,
-        string memory derivationPath
-    ) internal returns (bytes memory) {
-        return sign(self, to, data, operation, sender, getNonce(self), derivationPath);
-    }
 }
