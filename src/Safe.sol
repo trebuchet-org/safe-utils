@@ -302,6 +302,17 @@ library Safe {
         returns (bytes memory)
     {
         uint256 nonce = getNonce(self);
+
+        // For private keys, sign in-memory via vm.sign — no FFI, no CLI argument size limits
+        if (signer(self).signerType == SignerType.PrivateKey) {
+            bytes32 digest = getSafeTxHash(self, to, 0, data, operation, nonce);
+            Signature memory sig;
+            (sig.v, sig.r, sig.s) = vm.sign(signer(self).privateKey, digest);
+            return abi.encodePacked(sig.r, sig.s, sig.v);
+        }
+
+        // Hardware wallets: write payload to file and use --from-file to avoid
+        // "Argument list too long" (os error 7) when data is large.
         string memory payload = string.concat(
             '{"domain":{"chainId":"',
             vm.toString(block.chainid),
@@ -317,28 +328,23 @@ library Safe {
             vm.toString(nonce),
             ',"safeTxGas":"0"},"primaryType":"SafeTx","types":{"SafeTx":[{"name":"to","type":"address"},{"name":"value","type":"uint256"},{"name":"data","type":"bytes"},{"name":"operation","type":"uint8"},{"name":"safeTxGas","type":"uint256"},{"name":"baseGas","type":"uint256"},{"name":"gasPrice","type":"uint256"},{"name":"gasToken","type":"address"},{"name":"refundReceiver","type":"address"},{"name":"nonce","type":"uint256"}]}}'
         );
-        string[] memory inputs;
-        if (signer(self).signerType == SignerType.Ledger || signer(self).signerType == SignerType.Trezor) {
-            inputs = new string[](8);
-            inputs[0] = "cast";
-            inputs[1] = "wallet";
-            inputs[2] = "sign";
-            inputs[3] = string.concat("--", signer(self).signerType == SignerType.Ledger ? "ledger" : "trezor");
-            inputs[4] = "--mnemonic-derivation-path";
-            inputs[5] = signer(self).derivationPath;
-            inputs[6] = "--data";
-            inputs[7] = payload;
-        } else {
-            inputs = new string[](7);
-            inputs[0] = "cast";
-            inputs[1] = "wallet";
-            inputs[2] = "sign";
-            inputs[3] = string.concat("--private-key");
-            inputs[4] = vm.toString(bytes32(signer(self).privateKey));
-            inputs[5] = "--data";
-            inputs[6] = payload;
-        }
+
+        string memory tmpFile = "cache/treb_safe_sign_payload.json";
+        vm.writeFile(tmpFile, payload);
+
+        string[] memory inputs = new string[](9);
+        inputs[0] = "cast";
+        inputs[1] = "wallet";
+        inputs[2] = "sign";
+        inputs[3] = string.concat("--", signer(self).signerType == SignerType.Ledger ? "ledger" : "trezor");
+        inputs[4] = "--mnemonic-derivation-path";
+        inputs[5] = signer(self).derivationPath;
+        inputs[6] = "--data";
+        inputs[7] = "--from-file";
+        inputs[8] = tmpFile;
+
         bytes memory output = vm.ffi(inputs);
+        vm.removeFile(tmpFile);
         return output;
     }
 }
