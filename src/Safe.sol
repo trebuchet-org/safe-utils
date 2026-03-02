@@ -238,6 +238,15 @@ library Safe {
         internal
         returns (bytes32)
     {
+        return proposeTransactions(self, targets, datas, getNonce(self));
+    }
+
+    function proposeTransactions(
+        Client storage self,
+        address[] memory targets,
+        bytes[] memory datas,
+        uint256 nonce
+    ) internal returns (bytes32) {
         (address to, bytes memory data) = getProposeTransactionsTargetAndData(self, targets, datas);
         // using DelegateCall to preserve msg.sender across sub-calls
         ExecTransactionParams memory params = ExecTransactionParams({
@@ -246,8 +255,8 @@ library Safe {
             data: data,
             operation: Enum.Operation.DelegateCall,
             sender: signer(self).signer,
-            signature: sign(self, to, data, Enum.Operation.DelegateCall),
-            nonce: getNonce(self)
+            signature: sign(self, to, data, Enum.Operation.DelegateCall, nonce),
+            nonce: nonce
         });
         return proposeTransaction(self, params);
     }
@@ -301,8 +310,13 @@ library Safe {
         internal
         returns (bytes memory)
     {
-        uint256 nonce = getNonce(self);
+        return sign(self, to, data, operation, getNonce(self));
+    }
 
+    function sign(Client storage self, address to, bytes memory data, Enum.Operation operation, uint256 nonce)
+        internal
+        returns (bytes memory)
+    {
         // For private keys, sign in-memory via vm.sign — no FFI, no CLI argument size limits
         if (signer(self).signerType == SignerType.PrivateKey) {
             bytes32 digest = getSafeTxHash(self, to, 0, data, operation, nonce);
